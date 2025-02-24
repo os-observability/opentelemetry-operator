@@ -6,6 +6,7 @@ package collector
 import (
 	"context"
 	"fmt"
+	"reflect"
 
 	"github.com/go-logr/logr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -35,18 +36,34 @@ func HandleReconcileStatus(ctx context.Context, log logr.Logger, params manifest
 	}
 	changed := otelcol.DeepCopy()
 
-	up := &collectorupgrade.VersionUpgrade{
-		Log:      params.Log,
-		Version:  version.Get(),
-		Client:   params.Client,
-		Recorder: params.Recorder,
+	// handle upgrades in case the instance got switched from unmanaged to managed mode
+	if otelcol.Spec.UpgradeStrategy == v1beta1.UpgradeStrategyAutomatic {
+		up := &collectorupgrade.VersionUpgrade{
+			Log:      params.Log,
+			Version:  version.Get(),
+			Client:   params.Client,
+			Recorder: params.Recorder,
+		}
+		upgraded, upgradeErr := up.ManagedInstance(ctx, *changed)
+		if upgradeErr != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to upgrade the OpenTelemetry CR: %w", upgradeErr)
+		}
+		changed = &upgraded
+
+		if !reflect.DeepEqual(otelcol, *changed) {
+			// the resource update overrides the status, so keep a copy
+			st := changed.Status
+
+			patch := client.MergeFrom(&otelcol)
+			if patchErr := params.Client.Patch(ctx, changed, patch); patchErr != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to apply changes to the OpenTelemetry CR: %w", patchErr)
+			}
+
+			changed.Status = st
+			log.Info("instance upgraded", "version", changed.Status.Version)
+		}
 	}
-	upgraded, upgradeErr := up.ManagedInstance(ctx, *changed)
-	if upgradeErr != nil {
-		// don't fail to allow setting the status
-		log.V(2).Error(upgradeErr, "failed to upgrade the OpenTelemetry CR")
-	}
-	changed = &upgraded
+
 	statusErr := updateCollectorStatus(ctx, params.Client, changed)
 	if statusErr != nil {
 		params.Recorder.Event(changed, eventTypeWarning, reasonStatusFailure, statusErr.Error())
